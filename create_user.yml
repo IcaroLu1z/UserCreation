@@ -1,0 +1,186 @@
+---
+- name: Criar usuário de laboratório nos servidores selecionados
+  hosts: all_servers
+  gather_facts: yes
+  become: yes
+  vars_prompt:
+    - name: new_username
+      prompt: "Digite o nome do novo usuário"
+      private: no
+
+    - name: user_type
+      prompt: "Aluno do PPG? (sim/nao)"
+      private: no
+      default: "nao"
+
+  vars:
+    # Define em quais hosts o usuário será criado com base no tipo
+    grupo_alvo: "{{ 'all_servers' if user_type == 'sim' else 'pub_servers' }}"
+    diretorio_home: "/home/{{ new_username }}"
+    diretorio_work: "/media/work/{{ new_username }}"
+
+  pre_tasks:
+    # 1. Gerar senha aleatória de 12 caracteres (apenas letras e números)
+    - name: Gerar senha aleatória de 12 caracteres
+      shell: tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12
+      register: random_password_result
+      delegate_to: localhost
+      run_once: true
+      check_mode: no
+
+    - name: Definir a nova senha como uma variável de fato
+      set_fact:
+        new_password: "{{ random_password_result.stdout }}"
+        hashed_password: "{{ random_password_result.stdout | password_hash('sha512') }}"
+      run_once: true
+
+    # 2. Calcular o próximo UID disponível na Bridge (garante consistência em todos os hosts)
+
+    - name: Obter o maior UID em uso no intervalo 1000-1999
+      shell: "getent passwd | awk -F: '$3 >= 1000 && $3 <= 1999 {print $3}' | sort -n | tail -1"
+      register: max_uid_result
+      delegate_to: localhost
+      run_once: true
+      check_mode: no
+
+    - name: Definir o novo UID (maior UID + 1, no mínimo 1000)
+      set_fact:
+        new_uid: "{{ [max_uid_result.stdout | int + 1, 1000] | max }}"
+      run_once: true
+
+    # 3. Verificar se o usuário já existe no host atual
+
+    - name: Verificar se o usuário já existe neste host
+      getent:
+        database: passwd
+        key: "{{ new_username }}"
+      register: user_exists
+      ignore_errors: yes
+      check_mode: no 
+
+    - name: Falhar se o usuário já existir
+      fail:
+        msg: "O usuário {{ new_username }} já existe em {{ inventory_hostname }}."
+      when: user_exists.ansible_facts.getent_passwd[new_username] is defined
+
+  tasks:
+    # ----- PULAR O SERVIDOR DE PÓS-GRADUAÇÃO PARA USUÁRIOS REGULARES -----
+    - name: Criar o grupo do usuário com o mesmo GID
+      group:
+        name: "{{ new_username }}"
+        gid: "{{ new_uid }}"
+        state: present
+      when: not (inventory_hostname in groups['ppg_servers'] and user_type == 'nao')
+
+    - name: Criar a conta de usuário com UID/GID fixos
+      user:
+        name: "{{ new_username }}"
+        uid: "{{ new_uid }}"
+        group: "{{ new_username }}"
+        home: "{{ diretorio_home }}"
+        shell: /bin/bash
+        password: "{{ hashed_password }}"
+        create_home: yes
+        state: present
+      when: not (inventory_hostname in groups['ppg_servers'] and user_type == 'nao')
+
+    - name: Criar o diretório /media/work/{{ new_username }} na NAS (via bridge)
+      file:
+        path: "{{ diretorio_work }}"
+        state: directory
+        owner: "{{ new_username }}"
+        group: "{{ new_username }}"
+        mode: '0755'
+      delegate_to: localhost 
+      run_once: true
+      when: not ( 'bridge' in groups['ppg_servers'] and user_type == 'nao' )
+
+    - name: Configurar preferências do nano (.nanorc)
+      copy:
+        content: |
+          set tabsize 2
+          set tabstospaces
+        dest: "{{ diretorio_home }}/.nanorc"
+        owner: "{{ new_username }}"
+        group: "{{ new_username }}"
+        mode: '0644'
+      when: not (inventory_hostname in groups['ppg_servers'] and user_type == 'nao')
+
+    - name: Adicionar fonte de ambiente ao .bashrc
+      blockinfile:
+        path: "{{ diretorio_home }}/.bashrc"
+        block: |
+          # Minhas alterações (gerenciado pelo Ansible)
+          source /media/data/config/configs/env-csilab-000.sh
+          source /media/data/config/configs/env-csilab-001.sh
+        marker: "# {mark} BLOCO GERENCIADO PELO ANSIBLE"
+        create: yes
+        owner: "{{ new_username }}"
+        group: "{{ new_username }}"
+        mode: '0644'
+      when: not (inventory_hostname in groups['ppg_servers'] and user_type == 'nao')
+
+    # ----- GERENCIAMENTO DE CHAVE SSH (NA BRIDGE) -----
+    - name: Gerar chave SSH para o usuário na Bridge (se não existir)
+      command:
+        cmd: ssh-keygen -t rsa -b 4096 -N "" -f /home/{{ new_username }}/.ssh/id_rsa
+        creates: /home/{{ new_username }}/.ssh/id_rsa
+      when: 
+        - inventory_hostname == 'bridge'
+        - not ansible_check_mode
+      become: yes
+      become_user: "{{ new_username }}"
+      register: keygen_result
+
+    - name: Ler a chave pública da Bridge
+      slurp:
+        src: /home/{{ new_username }}/.ssh/id_rsa.pub
+      register: pub_key_slurp
+      when: 
+        - inventory_hostname == 'bridge'
+        - not ansible_check_mode
+      become: yes
+      become_user: "{{ new_username }}"
+
+    # ----- DISTRIBUIR A CHAVE SSH PARA TODOS OS SERVIDORES ALVO -----
+    - name: Distribuir a chave pública SSH para os servidores remotos
+      authorized_key:
+        user: "{{ new_username }}"
+        state: present
+        key: "{{ hostvars['bridge']['pub_key_slurp']['content'] | b64decode | trim }}"
+      when:
+        - not (inventory_hostname in groups['ppg_servers'] and user_type == 'nao')
+        - inventory_hostname != 'bridge'   # A Bridge já tem a chave (foi gerada lá)
+        - not ansible_check_mode
+        - hostvars['bridge']['pub_key_slurp'] is defined
+
+    # ----- GRUPO DOCKER -----
+    - name: Garantir que o grupo docker exista (se o Docker estiver instalado)
+      group:
+        name: docker
+        state: present
+      when: not (inventory_hostname in groups['ppg_servers'] and user_type == 'nao')
+      ignore_errors: yes
+
+    - name: Adicionar o usuário ao grupo docker
+      user:
+        name: "{{ new_username }}"
+        groups: docker
+        append: yes
+      when: not (inventory_hostname in groups['ppg_servers'] and user_type == 'nao')
+      ignore_errors: yes
+
+    # ----- EXIBIR CREDENCIAIS NO FINAL (APENAS NA BRIDGE) -----
+    - name: Exibir credenciais do novo usuário
+      debug:
+        msg:
+          - "############################################"
+          - "USUÁRIO CRIADO COM SUCESSO!"
+          - "Nome de usuário: {{ new_username }}"
+          - "Senha gerada: {{ new_password }}"
+          - "UID atribuído: {{ new_uid }}"
+          - "############################################"
+          - "IMPORTANTE: Envie esta senha para o usuário e"
+          - "oriente-o a trocá-la no primeiro login (com 'passwd')."
+      run_once: true
+      when: inventory_hostname == 'bridge'

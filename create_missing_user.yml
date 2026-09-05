@@ -1,0 +1,124 @@
+---
+- name: Obter informações do usuário {{ usuario_atual }} na bridge
+  command: "getent passwd {{ usuario_atual }}"
+  register: user_info
+  delegate_to: localhost
+  run_once: true
+  check_mode: no
+
+- name: Extrair UID, GID e home
+  set_fact:
+    user_uid: "{{ user_info.stdout.split(':')[2] }}"
+    user_gid: "{{ user_info.stdout.split(':')[3] }}"
+    user_home: "{{ user_info.stdout.split(':')[5] }}"
+
+- name: Obter nome do grupo
+  command: "getent group {{ user_gid }}"
+  register: group_info
+  delegate_to: localhost
+  ignore_errors: yes
+  check_mode: no
+
+- name: Definir nome do grupo
+  set_fact:
+    user_group: "{{ group_info.stdout.split(':')[0] if group_info.rc == 0 else usuario_atual }}"
+
+- name: Obter hash da senha do usuário
+  command: "getent shadow {{ usuario_atual }}"
+  register: shadow_info
+  delegate_to: localhost
+  ignore_errors: yes
+  check_mode: no
+
+- name: Definir hash da senha
+  set_fact:
+    user_password_hash: "{{ shadow_info.stdout.split(':')[1] if shadow_info.rc == 0 else '' }}"
+
+# ----- CRIAR GRUPO E USUÁRIO -----
+- name: Criar grupo com GID correto
+  group:
+    name: "{{ user_group }}"
+    gid: "{{ user_gid }}"
+    state: present
+
+- name: Criar usuário com UID/GID e senha hash
+  user:
+    name: "{{ usuario_atual }}"
+    uid: "{{ user_uid }}"
+    group: "{{ user_group }}"
+    home: "{{ user_home }}"
+    shell: /bin/bash
+    password: "{{ user_password_hash if user_password_hash != '' else '!' }}"
+    create_home: yes
+    state: present
+
+# ----- GARANTIR PERMISSÕES DO /media/work NA NAS -----
+- name: Garantir permissões do diretório /media/work/{{ usuario_atual }}
+  file:
+    path: "{{ nas_work_base }}/{{ usuario_atual }}"
+    state: directory
+    owner: "{{ usuario_atual }}"
+    group: "{{ user_group }}"
+    mode: '0755'
+  delegate_to: localhost
+  run_once: true
+  ignore_errors: yes
+
+# ----- CONFIGURAÇÕES DO USUÁRIO (NANO, BASHRC) -----
+- name: Configurar .nanorc
+  copy:
+    content: |
+      set tabsize 2
+      set tabstospaces
+    dest: "{{ user_home }}/.nanorc"
+    owner: "{{ usuario_atual }}"
+    group: "{{ user_group }}"
+    mode: '0644'
+
+- name: Adicionar fontes de ambiente ao .bashrc
+  blockinfile:
+    path: "{{ user_home }}/.bashrc"
+    block: |
+      # Minhas alterações (gerenciado pelo Ansible)
+      source /media/data/config/configs/env-csilab-000.sh
+      source /media/data/config/configs/env-csilab-001.sh
+    marker: "# {mark} BLOCO GERENCIADO PELO ANSIBLE"
+    create: yes
+    owner: "{{ usuario_atual }}"
+    group: "{{ user_group }}"
+    mode: '0644'
+
+# ----- CHAVE SSH (COPIAR DA BRIDGE) -----
+- name: Ler a chave pública do usuário na bridge
+  slurp:
+    src: "{{ user_home }}/.ssh/id_rsa.pub"
+  register: pub_key
+  delegate_to: localhost
+  become: yes
+  become_user: "{{ usuario_atual }}"
+  ignore_errors: yes
+
+- name: Instalar chave pública no host alvo
+  authorized_key:
+    user: "{{ usuario_atual }}"
+    state: present
+    key: "{{ pub_key['content'] | b64decode | trim }}"
+  when: pub_key is succeeded
+
+# ----- GRUPO DOCKER -----
+- name: Garantir grupo docker
+  group:
+    name: docker
+    state: present
+  ignore_errors: yes
+
+- name: Adicionar ao grupo docker
+  user:
+    name: "{{ usuario_atual }}"
+    groups: docker
+    append: yes
+  ignore_errors: yes
+
+- name: Confirmar criação do usuário
+  debug:
+    msg: "✅ Usuário {{ usuario_atual }} (UID {{ user_uid }}) criado em {{ inventory_hostname }}"

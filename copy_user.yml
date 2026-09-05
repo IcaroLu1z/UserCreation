@@ -1,0 +1,180 @@
+---
+- name: Copia um usuário existente na bridge para outros servidores
+  hosts: "{{ servidores_alvo | default('all_servers') }}"
+  gather_facts: yes
+  become: yes
+  vars_prompt:
+    - name: nome_usuario
+      prompt: "Digite o nome do usuário a ser sincronizado"
+      private: no
+
+    - name: servidores_alvo
+      prompt: "Digite os hosts alvo ou 'todos' para todos os servidores"
+      private: no
+      default: "todos"
+
+  vars:
+    bridge_host: "bridge"
+    host_list: "{{ 'all_servers' if servidores_alvo == 'todos' else servidores_alvo.split(',') }}"
+    diretorio_home: "/home/{{ nome_usuario }}"
+    diretorio_work: "/media/work/{{ nome_usuario }}"
+
+  pre_tasks:
+    - name: Verificar se o usuário existe na bridge
+      command: "getent passwd {{ nome_usuario }}"
+      register: usuario_bridge
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: Falhar se o usuário não existir na bridge
+      fail:
+        msg: "Usuário {{ nome_usuario }} não encontrado no servidor {{ bridge_host }}."
+      when: usuario_bridge.rc != 0
+
+    - name: Extrair UID, GID e nome do grupo
+      set_fact:
+        uid_usuario: "{{ usuario_bridge.stdout.split(':')[2] }}"
+        gid_usuario: "{{ usuario_bridge.stdout.split(':')[3] }}"
+
+    - name: Obter nome do grupo a partir do GID
+      command: "getent group {{ gid_usuario }}"
+      register: grupo_bridge
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: Definir nome do grupo
+      set_fact:
+        nome_grupo: "{{ grupo_bridge.stdout.split(':')[0] if grupo_bridge.rc == 0 else nome_usuario }}"
+
+    - name: Obter hash da senha do usuário
+      command: "getent shadow {{ nome_usuario }}"
+      register: shadow_bridge
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: Extrair hash da senha
+      set_fact:
+        senha_hash: "{{ shadow_bridge.stdout.split(':')[1] if shadow_bridge.rc == 0 else '' }}"
+
+  tasks:
+    - name: Verificar se o usuário já existe neste host
+      getent:
+        database: passwd
+        key: "{{ nome_usuario }}"
+      register: user_exists
+      ignore_errors: yes
+
+    - name: Informar que o usuário já existe e pular
+      debug:
+        msg: "Usuário {{ nome_usuario }} já existe em {{ inventory_hostname }}. Pulando."
+      when: user_exists.ansible_facts.getent_passwd[nome_usuario] is defined
+
+    - block:
+        - name: Criar o grupo do usuário com o GID correto
+          group:
+            name: "{{ nome_grupo }}"
+            gid: "{{ gid_usuario }}"
+            state: present
+
+        - name: Criar a conta de usuário com UID/GID fixos e senha hash
+          user:
+            name: "{{ nome_usuario }}"
+            uid: "{{ uid_usuario }}"
+            group: "{{ nome_grupo }}"
+            home: "{{ diretorio_home }}"
+            shell: /bin/bash
+            password: "{{ senha_hash if senha_hash != '' else '!' }}"
+            create_home: yes
+            state: present
+          when: senha_hash != ''
+
+        - name: Se não houver hash de senha, gerar uma senha aleatória
+          block:
+            - name: Gerar senha aleatória de 12 caracteres
+              shell: tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12
+              register: nova_senha
+              run_once: true
+
+            - name: Definir senha temporária
+              user:
+                name: "{{ nome_usuario }}"
+                password: "{{ nova_senha.stdout | password_hash('sha512') }}"
+                update_password: always
+
+            - name: Exibir senha temporária
+              debug:
+                msg: "Senha temporária para {{ nome_usuario }}: {{ nova_senha.stdout }}"
+          when: senha_hash == ''
+
+        # ----- DIRETÓRIO /media/work NA NAS (já existe, mas garantimos permissões) -----
+        - name: Garantir permissões do diretório /media/work/{{ nome_usuario }} na NAS
+          file:
+            path: "{{ diretorio_work }}"
+            state: directory
+            owner: "{{ nome_usuario }}"
+            group: "{{ nome_grupo }}"
+            mode: '0755'
+          delegate_to: localhost
+          run_once: true
+          ignore_errors: yes
+
+        # ----- CONFIGURAÇÕES DO USUÁRIO -----
+        - name: Configurar .nanorc
+          copy:
+            content: |
+              set tabsize 2
+              set tabstospaces
+            dest: "{{ diretorio_home }}/.nanorc"
+            owner: "{{ nome_usuario }}"
+            group: "{{ nome_grupo }}"
+            mode: '0644'
+
+        - name: Adicionar fontes de ambiente ao .bashrc (env-000 e env-001)
+          blockinfile:
+            path: "{{ diretorio_home }}/.bashrc"
+            block: |
+              # Minhas alterações (gerenciado pelo Ansible)
+              source /media/data/config/configs/env-csilab-000.sh
+              source /media/data/config/configs/env-csilab-001.sh
+            marker: "# {mark} BLOCO GERENCIADO PELO ANSIBLE"
+            create: yes
+            owner: "{{ nome_usuario }}"
+            group: "{{ nome_grupo }}"
+            mode: '0644'
+
+        # ----- CHAVE SSH (copiar da bridge) -----
+        - name: Ler a chave pública do usuário na bridge
+          slurp:
+            src: "/home/{{ nome_usuario }}/.ssh/id_rsa.pub"
+          register: pub_key_slurp
+          delegate_to: localhost
+          become: yes
+          become_user: "{{ nome_usuario }}"
+          ignore_errors: yes
+
+        - name: Distribuir a chave pública SSH para o host alvo
+          authorized_key:
+            user: "{{ nome_usuario }}"
+            state: present
+            key: "{{ pub_key_slurp['content'] | b64decode | trim }}"
+          when: pub_key_slurp is succeeded
+
+        # ----- GRUPO DOCKER -----
+        - name: Garantir que o grupo docker exista
+          group:
+            name: docker
+            state: present
+          ignore_errors: yes
+
+        - name: Adicionar o usuário ao grupo docker
+          user:
+            name: "{{ nome_usuario }}"
+            groups: docker
+            append: yes
+          ignore_errors: yes
+
+        - name: Exibir confirmação para este host
+          debug:
+            msg: "✅ Usuário {{ nome_usuario }} sincronizado com sucesso para {{ inventory_hostname }} (UID {{ uid_usuario }})"
+
+      when: user_exists.ansible_facts.getent_passwd[nome_usuario] is not defined

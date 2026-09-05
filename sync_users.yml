@@ -1,0 +1,72 @@
+---
+- name: Sincronizar todos os usuários da bridge para os servidores alvo
+  hosts: "{{ servidores_alvo | default('pub_servers') }}"
+  gather_facts: yes
+  become: yes
+  vars_prompt:
+    - name: servidores_alvo
+      prompt: "Digite os hosts alvo ou 'todos' para todos os servidores (exceto bridge)"
+      private: no
+      default: "todos"
+
+  vars:
+    bridge_host: "bridge"
+    host_list: "{{ 'pub_servers' if servidores_alvo == 'todos' else servidores_alvo.split(',') }}"
+    nas_work_base: "/media/work"
+
+  pre_tasks:
+    # ----- OBTER LISTA DE USUÁRIOS DA BRIDGE (UID ENTRE 1000 E 1999) -----
+    - name: Obter lista de usuários da bridge com UID entre 1000 e 1999
+      shell: "getent passwd | awk -F: '$3 >= 1000 && $3 <= 1999 {print $1}'"
+      register: bridge_users_raw
+      delegate_to: localhost
+      run_once: true
+      check_mode: no
+
+    - name: Converter lista de usuários em uma lista Python
+      set_fact:
+        bridge_users: "{{ bridge_users_raw.stdout.split('\n') | select('match', '.+') | list }}"
+      run_once: true
+
+    - name: Exibir quantidade de usuários a sincronizar
+      debug:
+        msg: "Total de usuários na bridge (UID 1000-1999): {{ bridge_users | length }}"
+      run_once: true
+
+    # ----- OBTER LISTA DE USUÁRIOS DO HOST ATUAL (PARA COMPARAÇÃO) -----
+    - name: Obter lista de usuários existentes no host atual
+      shell: "getent passwd | awk -F: '$3 >= 1000 && $3 <= 1999 {print $1}'"
+      register: current_host_users_raw
+      changed_when: false
+      check_mode: no
+
+    - name: Converter lista do host atual em lista Python
+      set_fact:
+        current_host_users: "{{ current_host_users_raw.stdout.split('\n') | select('match', '.+') | list }}"
+
+    - name: Calcular usuários faltantes neste host
+      set_fact:
+        missing_users: "{{ bridge_users | difference(current_host_users) }}"
+
+    - name: Exibir usuários faltantes para este host
+      debug:
+        msg: "Usuários faltantes em {{ inventory_hostname }}: {{ missing_users }}"
+
+  tasks:
+    # ----- PARA CADA USUÁRIO FALTANTE, CRIAR NO HOST ATUAL -----
+    - name: Sincronizar usuários faltantes
+      include_tasks: create_missing_user.yml
+      loop: "{{ missing_users }}"
+      loop_control:
+        loop_var: usuario_atual
+      when: missing_users | length > 0
+
+    - name: Resumo final para este host
+      debug:
+        msg: "✅ Sincronização concluída para {{ inventory_hostname }}. Foram criados {{ missing_users | length }} usuários."
+      when: missing_users | length > 0
+
+    - name: Aviso se não houver usuários faltantes
+      debug:
+        msg: "ℹ️ Nenhum usuário faltante em {{ inventory_hostname }}. Nada a fazer."
+      when: missing_users | length == 0
