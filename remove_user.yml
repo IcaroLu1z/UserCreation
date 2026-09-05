@@ -1,0 +1,65 @@
+---
+- name: Remover um usuário do laboratório (de um ou todos os servidores)
+  hosts: "{{ host_alvo | default('all_servers') }}"
+  become: yes
+  vars_prompt:
+    - name: nome_usuario
+      prompt: "Digite o nome do usuário a ser removido"
+      private: no
+
+    - name: host_alvo
+      prompt: "Digite o host específico (ou 'todos' para remover de todos os servidores)"
+      private: no
+      default: "todos"
+
+    - name: remover_dados
+      prompt: "Remover também os diretórios home, /media/work e chaves SSH? (sim/nao)"
+      private: no
+      default: "nao"
+
+  vars:
+    alvo_para_execucao: "{{ 'all_servers' if host_alvo == 'todos' else host_alvo }}"
+
+  pre_tasks:
+    - name: Verificar se o usuário existe neste host
+      getent:
+        database: passwd
+        key: "{{ nome_usuario }}"
+      register: user_exists
+
+    - name: Avisar se usuário não existe e pular
+      debug:
+        msg: "Usuário {{ nome_usuario }} não existe em {{ inventory_hostname }}, ignorando."
+      when: user_exists.ansible_facts.getent_passwd[nome_usuario] is not defined
+
+  tasks:
+    - block:
+        - name: Remover a conta de usuário (e home se solicitado)
+          user:
+            name: "{{ nome_usuario }}"
+            state: absent
+            remove: "{{ 'yes' if remover_dados == 'sim' else 'no' }}"
+          register: remocao_usuario
+
+        - name: Remover /media/work/{{ nome_usuario }} se solicitado
+          file:
+            path: "/media/work/{{ nome_usuario }}"
+            state: absent
+          when: remover_dados == 'sim'
+          delegate_to: localhost  
+          run_once: true
+          ignore_errors: yes
+
+        - name: Remover diretório .ssh local na Bridge (se estiver removendo dados)
+          file:
+            path: "/home/{{ nome_usuario }}/.ssh"
+            state: absent
+          when:
+            - remover_dados == 'sim'
+            - inventory_hostname == 'bridge'
+          delegate_to: localhost
+
+        - name: Exibir confirmação
+          debug:
+            msg: "✅ Usuário {{ nome_usuario }} removido de {{ inventory_hostname }}"
+      when: user_exists.ansible_facts.getent_passwd[nome_usuario] is defined
