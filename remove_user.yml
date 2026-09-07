@@ -8,7 +8,7 @@
       private: no
 
     - name: host_alvo
-      prompt: "Digite o host específico (ou 'todos' para remover de todos os servidores)"
+      prompt: "Digite o servidor alvo (ou 'todos' para remover de todos os servidores)"
       private: no
       default: "todos"
 

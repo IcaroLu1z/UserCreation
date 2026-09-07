@@ -5,11 +5,11 @@
   become: yes
   vars_prompt:
     - name: nome_usuario
-      prompt: "Digite o nome do usuário a ser sincronizado"
+      prompt: "Digite o nome do usuário a ser copiado: "
       private: no
 
     - name: servidores_alvo
-      prompt: "Digite os hosts alvo ou 'todos' para todos os servidores"
+      prompt: "Digite os hosts alvo ou 'todos' para todos os servidores: "
       private: no
       default: "todos"
 
@@ -87,24 +87,6 @@
             create_home: yes
             state: present
           when: senha_hash != ''
-
-        - name: Se não houver hash de senha, gerar uma senha aleatória
-          block:
-            - name: Gerar senha aleatória de 12 caracteres
-              shell: tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 12
-              register: nova_senha
-              run_once: true
-
-            - name: Definir senha temporária
-              user:
-                name: "{{ nome_usuario }}"
-                password: "{{ nova_senha.stdout | password_hash('sha512') }}"
-                update_password: always
-
-            - name: Exibir senha temporária
-              debug:
-                msg: "Senha temporária para {{ nome_usuario }}: {{ nova_senha.stdout }}"
-          when: senha_hash == ''
 
         # ----- DIRETÓRIO /media/work NA NAS (já existe, mas garantimos permissões) -----
         - name: Garantir permissões do diretório /media/work/{{ nome_usuario }} na NAS

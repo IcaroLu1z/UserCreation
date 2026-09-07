@@ -34,8 +34,7 @@
         hashed_password: "{{ random_password_result.stdout | password_hash('sha512') }}"
       run_once: true
 
-    # 2. Calcular o próximo UID disponível na Bridge (garante consistência em todos os hosts)
-
+    # 2. Calcular o próximo UID disponível na Bridge
     - name: Obter o maior UID em uso no intervalo 1000-1999
       shell: "getent passwd | awk -F: '$3 >= 1000 && $3 <= 1999 {print $3}' | sort -n | tail -1"
       register: max_uid_result
@@ -49,7 +48,6 @@
       run_once: true
 
     # 3. Verificar se o usuário já existe no host atual
-
     - name: Verificar se o usuário já existe neste host
       getent:
         database: passwd
