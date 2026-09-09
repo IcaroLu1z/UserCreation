@@ -1,6 +1,6 @@
 ---
 - name: Remover um usuário do laboratório (de um ou todos os servidores)
-  hosts: "{{ host_alvo | default('all_servers') }}"
+  hosts: "{{ alvo_para_execucao }}"
   become: yes
   vars_prompt:
     - name: nome_usuario
